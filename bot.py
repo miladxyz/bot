@@ -95,7 +95,7 @@ DOWNLOAD_OPTS = {
     "noprogress": True,                 # keeps the log readable
     "source_address": "0.0.0.0",
     "retries": 3,
-    "extractor_args": {"youtube": {"player_client": ["mweb", "default"]}},
+    "extractor_args": {"youtube": {"formats": ["missing_pot"]}},
     "postprocessors": [
         {
             "key": "FFmpegExtractAudio",
