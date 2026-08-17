@@ -1,9 +1,9 @@
 """
-Telegram music bot — search a song, tap a result (or reply with its number),
-get it back as an audio file.
+Telegram music bot — search a song, tap a result, get it back as an audio file.
+Every file is captioned with the bot's @username so shared tracks carry a link back.
 
 Termux setup:
-    pkg install python ffmpeg nodejs
+    pkg install python ffmpeg
     pip install -U python-telegram-bot yt-dlp
     export BOT_TOKEN="123456:ABC..."
     python bot.py
@@ -35,6 +35,7 @@ from yt_dlp import YoutubeDL
 # --------------------------------------------------------------------------- #
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+BOT_USERNAME = "music_24a_bot"         # no @, used in captions
 RESULTS_PER_SEARCH = 5
 MAX_DURATION = 1500                    # seconds; skip anything over ~25 min
 MAX_UPLOAD_BYTES = 49 * 1024 * 1024    # Bot API caps uploads at 50 MB
@@ -92,9 +93,10 @@ DOWNLOAD_OPTS = {
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
-    "noprogress": True,                 # keeps the log readable
+    "noprogress": True,
     "source_address": "0.0.0.0",
     "retries": 3,
+    # allow formats that lack a PO token — this is what fixes the 403s
     "extractor_args": {"youtube": {"formats": ["missing_pot"]}},
     "postprocessors": [
         {
@@ -146,11 +148,15 @@ def fmt_duration(seconds) -> str:
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🎵 Send me a song name and I'll send it back as audio.\n\n"
-        "Pick a result by tapping a button, or just reply with its number."
+        "Tap one of the numbered buttons to download."
     )
 
 
-async def do_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str) -> None:
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.message.text.strip()[:200]
+    if not query:
+        return
+
     status = await update.message.reply_text(
         f"🔎 Searching for <i>{html.escape(query)}</i>…", parse_mode="HTML"
     )
@@ -170,9 +176,6 @@ async def do_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str) 
         await status.edit_text("Nothing found. Try different wording.")
         return
 
-    # remember for the number-reply shortcut
-    ctx.user_data["last_results"] = [r["id"] for r in results]
-
     rows, lines = [], []
     for i, r in enumerate(results, 1):
         title = r.get("title", "Unknown")
@@ -184,47 +187,22 @@ async def do_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str) 
         rows.append(InlineKeyboardButton(str(i), callback_data=f"dl:{r['id']}"))
 
     await status.edit_text(
-        "\n".join(lines) + "\n\nTap a number (or reply with it):",
+        "\n".join(lines) + "\n\nTap a number to download:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([rows]),
         disable_web_page_preview=True,
     )
 
 
-async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text.strip()[:200]
-    if not text:
-        return
-
-    # bare number → a pick from the last search, not a new query
-    last = ctx.user_data.get("last_results")
-    if text.isdigit() and last and 1 <= int(text) <= len(last):
-        await deliver(update, ctx, last[int(text) - 1], update.message.chat_id)
-        return
-
-    await do_search(update, ctx, text)
-
-
 async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer("Working on it…")
-    await deliver(update, ctx, q.data.split(":", 1)[1], q.message.chat_id, query=q)
 
+    video_id = q.data.split(":", 1)[1]
+    chat_id = q.message.chat_id
+    log.info("download requested: %s", video_id)
 
-async def deliver(update, ctx, video_id: str, chat_id: int, query=None) -> None:
-    """Download video_id and send it to chat_id. `query` = callback to edit, if any."""
-    status = None
-
-    async def say(text: str):
-        nonlocal status
-        if query is not None:
-            await query.edit_message_text(text)
-        elif status is None:
-            status = await update.message.reply_text(text)
-        else:
-            await status.edit_text(text)
-
-    await say("⬇️ Downloading & converting…")
+    await q.edit_message_text("⬇️ Downloading & converting…")
     await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
 
     tmp = tempfile.mkdtemp(prefix="musicbot_")
@@ -233,29 +211,37 @@ async def deliver(update, ctx, video_id: str, chat_id: int, query=None) -> None:
 
         size = path.stat().st_size
         if size > MAX_UPLOAD_BYTES:
-            await say(
+            await q.edit_message_text(
                 f"⚠️ {size / 1024 / 1024:.0f} MB — over Telegram's 50 MB bot limit. "
                 "Pick a shorter version."
             )
             return
 
-        await say("⬆️ Uploading…")
+        title = info.get("track") or info.get("title", "Unknown")
+        artist = info.get("artist") or info.get("uploader") or "Unknown"
+
+        # caption travels with the file when anyone forwards or shares it
+        caption = (
+            f"🎵 <b>{html.escape(title[:80])}</b>\n"
+            f"<i>{html.escape(artist[:60])}</i>\n\n"
+            f"@{BOT_USERNAME}"
+        )
+
+        await q.edit_message_text("⬆️ Uploading…")
         with path.open("rb") as fh:
             await ctx.bot.send_audio(
                 chat_id=chat_id,
                 audio=fh,
-                title=(info.get("track") or info.get("title", "Unknown"))[:64],
-                performer=(info.get("artist") or info.get("uploader") or "Unknown")[:64],
+                title=title[:64],
+                performer=artist[:64],
                 duration=int(info.get("duration") or 0),
-                filename=f"{info.get('title', 'audio')[:60]}.mp3",
+                filename=f"{title[:60]}.mp3",
+                caption=caption,
+                parse_mode="HTML",
                 read_timeout=180,
                 write_timeout=180,
             )
-
-        if query is not None:
-            await query.delete_message()
-        elif status is not None:
-            await status.delete()
+        await q.delete_message()
 
     except Exception as e:
         log.exception("download failed for %s", video_id)
@@ -265,7 +251,7 @@ async def deliver(update, ctx, video_id: str, chat_id: int, query=None) -> None:
             else "❌ Couldn't fetch that one. Try another result."
         )
         try:
-            await say(msg)
+            await q.edit_message_text(msg)
         except Exception:
             await ctx.bot.send_message(chat_id, msg)
     finally:
